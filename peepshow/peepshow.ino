@@ -1,15 +1,5 @@
-/* This example shows how to get single-shot range
- measurements from the VL53L0X. The sensor can optionally be
- configured with different ranging profiles, as described in
- the VL53L0X API user manual, to get better performance for
- a certain application. This code is based on the four
- "SingleRanging" examples in the VL53L0X API.
-
- The range readings are in units of mm. */
-
 #include <Wire.h>
 #include <VL53L0X.h>
-
 
 #define NUMSENSORS          2
 
@@ -20,24 +10,75 @@ int centers[] = {100, 200};
 int xshut_pins[] = {6, 8};
 int addresses[] = {21, 22};
 int relative_location;
-float ratio;
-
-// Uncomment this line to use long range mode. This
-// increases the sensitivity of the sensor and extends its
-// potential range, but increases the likelihood of getting
-// an inaccurate reading because of reflections from objects
-// other than the intended target. It works best in dark
-// conditions.
 
 //#define LONG_RANGE
-
-
 // Uncomment ONE of these two lines to get
 // - higher speed at the cost of lower accuracy OR
 // - higher accuracy at the cost of lower speed
-
 //#define HIGH_SPEED
 //#define HIGH_ACCURACY
+
+#include <Adafruit_NeoPixel.h>
+#ifdef __AVR__
+#include <avr/power.h>
+#endif
+
+#define PIXEL_PIN            6
+#define NUMPIXELS      300
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+#define MAX_UCHAR 254
+float intensity;
+unsigned char mask[NUMPIXELS];
+unsigned char max_intensity = 150;
+const float pi = 3.14159;
+int run_time_ms;
+float location;
+int center;
+
+
+float gaussian_pdf(float x, float mu, float sigma) {
+  return 1. / sqrt(2 * pi * sigma * sigma) * exp(-(x - mu) * (x - mu) / (2 * sigma * sigma));
+}
+
+
+void initialize_mask() {
+  float width = (float) NUMPIXELS / 3.;
+  float sigma = width / 5.;
+  float maximum = gaussian_pdf(0., 0., sigma);
+
+  for (int i = 0; i < NUMPIXELS; i++) {
+    mask[i] = MAX_UCHAR * gaussian_pdf(i, NUMPIXELS / 2., sigma) / maximum;
+  }
+}
+
+
+int get_mask_value(int i, int center) {
+  int relative_location = (i - center) + NUMPIXELS / 2.;
+  if (relative_location >= NUMPIXELS || relative_location < 0) {
+    return 0;
+  } else {
+    return mask[relative_location];
+  }
+}
+
+
+void apply_masks() {
+  for (int i = 0; i < pixels.numPixels(); i++) {
+    intensity = 0.;
+    for (int j = 0; j < NUMSENSORS; j++) {
+      intensity += ratios[j] * get_mask_value(i, centers[j]);
+    }
+    int int_intensity = max_intensity * intensity;
+    Serial.print(intensity);
+    Serial.print(" ");
+    pixels.setPixelColor(i, pixels.Color(0, intensity, intensity));
+  }
+  pixels.show();
+  Serial.println("");
+  delay(100);
+}
 
 
 void configure_single_sensor(VL53L0X sensor) {
@@ -95,7 +136,7 @@ void read_sensors() {
         if (sensors[j].timeoutOccurred()) {
             Serial.print(" TIMEOUT");
         } else {
-          ratios[j] = dist;
+          ratios[j] = dist / 1000.;
           Serial.print(j); Serial.print(" : "); Serial.print(ratios[j]); Serial.print("  ");
         }
         delay(10);
@@ -110,12 +151,20 @@ void setup()
   Wire.begin();
 
   initialize_sensors();
+
+  pixels.begin(); // This initializes the NeoPixel library.
+  pixels.show(); // Initialize all pixels to 'off'
+
+  initialize_mask();
+  
+  delay(100);
+
 }
 
 void loop()
 {
-  
   read_sensors();
+  apply_masks();
   Serial.println();
   delay(10);
 }
