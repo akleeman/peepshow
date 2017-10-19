@@ -1,15 +1,26 @@
+/*
+ * An example of using multiple sensors to control a NEOPIXEL light strip.
+ * Each sensor is assigned a center pixel around which a gaussian density
+ * is used to define a light curve which is tied to that sensors distance
+ * reading.
+ */
 #include <Wire.h>
 #include <VL53L0X.h>
 
 #define NUMSENSORS          2
 
-// The distance sensor
+// Variables related to the distance sensor
 VL53L0X sensors[NUMSENSORS];
+// The ratio is used to scale the intensity of each curve, it
+// should take a value between 0 and 1
 float ratios[]= {0., 0.};
+// The pixel numbers around which each sensor's curve is centered
 int centers[] = {100, 200};
+// In order to set the address of each sensor on startup they
+// need to be wired to different pins which are defined here.
 int xshut_pins[] = {6, 8};
+// The new address of each sensor.
 int addresses[] = {21, 22};
-int relative_location;
 
 //#define LONG_RANGE
 // Uncomment ONE of these two lines to get
@@ -18,6 +29,7 @@ int relative_location;
 //#define HIGH_SPEED
 //#define HIGH_ACCURACY
 
+// Variables related to the light strip
 #include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
 #include <avr/power.h>
@@ -30,57 +42,58 @@ Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIXEL_PIN, NEO_GRB + NEO
 
 #define MAX_UCHAR 254
 float intensity;
-unsigned char mask[NUMPIXELS];
+unsigned char curve[NUMPIXELS];
 unsigned char max_intensity = 150;
-const float pi = 3.14159;
-int run_time_ms;
-float location;
-int center;
 
 
+// Computes the Gaussian density which is used to scale the light intensity
+// around some center LED.
 float gaussian_pdf(float x, float mu, float sigma) {
   return 1. / sqrt(2 * pi * sigma * sigma) * exp(-(x - mu) * (x - mu) / (2 * sigma * sigma));
 }
 
 
-void initialize_mask() {
+// Creates an intensity curve that speeds up the apply step by precomputing
+// the intensity curve that is centered around each sensor. 
+void initialize_curve() {
   float width = (float) NUMPIXELS / 3.;
   float sigma = width / 5.;
   float maximum = gaussian_pdf(0., 0., sigma);
 
   for (int i = 0; i < NUMPIXELS; i++) {
-    mask[i] = MAX_UCHAR * gaussian_pdf(i, NUMPIXELS / 2., sigma) / maximum;
+    curve[i] = MAX_UCHAR * gaussian_pdf(i, NUMPIXELS / 2., sigma) / maximum;
   }
 }
 
 
-int get_mask_value(int i, int center) {
+// Get the curve value for pixel `i` for a sensor that is centered at
+// pixel `center`.
+int get_curve_value(int i, int center) {
   int relative_location = (i - center) + NUMPIXELS / 2.;
   if (relative_location >= NUMPIXELS || relative_location < 0) {
     return 0;
   } else {
-    return mask[relative_location];
+    return curve[relative_location];
   }
 }
 
 
-void apply_masks() {
+// Overlays the curves for each sensor and sets the intensity at each pixel.
+void set_pixels() {
   for (int i = 0; i < pixels.numPixels(); i++) {
     intensity = 0.;
     for (int j = 0; j < NUMSENSORS; j++) {
-      intensity += ratios[j] * get_mask_value(i, centers[j]);
+      intensity += ratios[j] * get_curve_value(i, centers[j]);
     }
     int int_intensity = max_intensity * intensity;
-    Serial.print(intensity);
-    Serial.print(" ");
     pixels.setPixelColor(i, pixels.Color(0, intensity, intensity));
   }
+  delay(10);
   pixels.show();
-  Serial.println("");
-  delay(100);
 }
 
 
+// Sets the signal processing preferences a give sensor.
 void configure_single_sensor(VL53L0X sensor) {
     sensor.init();
     sensor.setTimeout(500);
@@ -102,6 +115,9 @@ void configure_single_sensor(VL53L0X sensor) {
     #endif
 }
 
+// Loops through each sensor and assigns a new address.  This
+// is required as all the sensors communicate over the i2c
+// interface but fire up with the same address.
 void initialize_sensors() {
     // Set all xshut pins to low, we'll bring them up one
     // at a time.
@@ -109,18 +125,19 @@ void initialize_sensors() {
         pinMode(xshut_pins[j], OUTPUT);
         digitalWrite(xshut_pins[j], LOW);
     }
-    delay(500);
+    delay(100);
   
     for (int j = 0; j < NUMSENSORS; j++) {
-        //SENSOR
+        // By changing the PIN mode we've set the pin
+        // to 'not LOW' (which is different than HIGH
         pinMode(xshut_pins[j], INPUT);
-        delay(150);
+        delay(5);
     
         Serial.print("Initializing sensor ");
-        Serial.println(j);
-        Serial.print("Setting address to ");
+        Serial.print(j);
+        Serial.print(" with address ");
         Serial.println(addresses[j]);
-        delay(100);
+        delay(5);
         sensors[j].init(true);
         sensors[j].setAddress(addresses[j]);
     
@@ -128,7 +145,8 @@ void initialize_sensors() {
     }
 }
 
-
+// reads the distance from each sensor and converts it to an intensity
+// ratio which is later used to scale the intensity.
 void read_sensors() {
     int dist;
     for (int j = 0; j < NUMSENSORS; j++) {
@@ -139,7 +157,6 @@ void read_sensors() {
           ratios[j] = dist / 1000.;
           Serial.print(j); Serial.print(" : "); Serial.print(ratios[j]); Serial.print("  ");
         }
-        delay(10);
     }
     Serial.println("");
 }
@@ -150,21 +167,22 @@ void setup()
   Serial.begin(9600);
   Wire.begin();
 
+  // Assign each sensor a different address and configure them.
   initialize_sensors();
-
-  pixels.begin(); // This initializes the NeoPixel library.
-  pixels.show(); // Initialize all pixels to 'off'
-
-  initialize_mask();
-  
+  // This initializes the NeoPixel library.
+  pixels.begin(); 
+  // Initialize all pixels to 'off'
+  pixels.show();
+  // Precompute the intensity curve.
+  initialize_curve();  
   delay(100);
-
 }
 
 void loop()
 {
+  // Read each sensor's value and turn it into an intensity ratio
   read_sensors();
-  apply_masks();
-  Serial.println();
+  // Refresh the light strip.
+  set_pixels();
   delay(10);
 }
