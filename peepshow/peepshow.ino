@@ -6,28 +6,47 @@
  */
 #include <Wire.h>
 #include <VL53L0X.h>
+#include <Filters.h>
 
-#define NUMSENSORS          2
+#define NUMSENSORS          10
+#define MAXSENSORS          10
 
 // Variables related to the distance sensor
 VL53L0X sensors[NUMSENSORS];
+bool sensor_available[NUMSENSORS];
 // The ratio is used to scale the intensity of each curve, it
 // should take a value between 0 and 1
-float ratios[]= {0., 0.};
+float ratios[]= {0., 0., 0., 0., 0., 0., 0., 0., 0., 0.};
 // The pixel numbers around which each sensor's curve is centered
-int centers[] = {100, 200};
+const int centers[] = {30, 60, 90, 120, 150, 180, 210, 240, 270};
 // In order to set the address of each sensor on startup they
 // need to be wired to different pins which are defined here.
-int xshut_pins[] = {6, 8};
+// Negative numbers indicate shift register pins.
+const int xshut_pins[] = {5, 6, 7, 8, 9, 10, A0, A1, A2, A3};
 // The new address of each sensor.
-int addresses[] = {21, 22};
+const int addresses[] = {30, 31, 32, 33, 35, 36, 37, 38, 39, 40};
+const int address_at_power_on = 41;
+unsigned long sensor_init_timeout = 10000;
+
+#define MAX_DIST      1200.
+#define ZERO_DIST     400
+#define MIN_DIST      200.
+#define SMOOTHING     0.8
+
+byte shift_register_data = 0;
+const int shift_register_data_pin = 4;
+const int shift_register_latch_pin = 5;
+const int shift_register_clock_pin = 6;
+
+FilterOnePole filters[NUMSENSORS];
 
 //#define LONG_RANGE
 // Uncomment ONE of these two lines to get
 // - higher speed at the cost of lower accuracy OR
 // - higher accuracy at the cost of lower speed
-//#define HIGH_SPEED
+#define HIGH_SPEED
 //#define HIGH_ACCURACY
+//#define MAXDIST      0.01  
 
 // Variables related to the light strip
 #include <Adafruit_NeoPixel.h>
@@ -35,16 +54,17 @@ int addresses[] = {21, 22};
 #include <avr/power.h>
 #endif
 
-#define PIXEL_PIN            6
+#define PIXEL_PIN        4
 #define NUMPIXELS      300
+#define MAXPIXELS      300
 
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 #define MAX_UCHAR 254
 float intensity;
 unsigned char curve[NUMPIXELS];
-unsigned char max_intensity = 150;
-
+float max_intensity = 254.;
+const float pi = 3.14159;
 
 // Computes the Gaussian density which is used to scale the light intensity
 // around some center LED.
@@ -57,7 +77,7 @@ float gaussian_pdf(float x, float mu, float sigma) {
 // the intensity curve that is centered around each sensor. 
 void initialize_curve() {
   float width = (float) NUMPIXELS / 3.;
-  float sigma = width / 5.;
+  float sigma = width / 1.;
   float maximum = gaussian_pdf(0., 0., sigma);
 
   for (int i = 0; i < NUMPIXELS; i++) {
@@ -68,27 +88,28 @@ void initialize_curve() {
 
 // Get the curve value for pixel `i` for a sensor that is centered at
 // pixel `center`.
-int get_curve_value(int i, int center) {
+float get_curve_value(int i, int center) {
   int relative_location = (i - center) + NUMPIXELS / 2.;
   if (relative_location >= NUMPIXELS || relative_location < 0) {
-    return 0;
+    return 0.;
   } else {
-    return curve[relative_location];
+    return ((float) curve[relative_location] / MAX_UCHAR);
   }
 }
 
 
 // Overlays the curves for each sensor and sets the intensity at each pixel.
 void set_pixels() {
-  for (int i = 0; i < pixels.numPixels(); i++) {
-    intensity = 0.;
+  for (int i = 0; i < NUMPIXELS; i++) {
+    intensity = 1.;
     for (int j = 0; j < NUMSENSORS; j++) {
-      intensity += ratios[j] * get_curve_value(i, centers[j]);
+      intensity -= (1. - ratios[j]) * get_curve_value(i, centers[j]);
     }
-    int int_intensity = max_intensity * intensity;
-    pixels.setPixelColor(i, pixels.Color(0, intensity, intensity));
+    intensity = min(max(0., intensity), 1.);
+    intensity = max_intensity * intensity * intensity;
+    pixels.setPixelColor(i, pixels.Color(0., intensity, intensity));
   }
-  delay(10);
+  delay(20);
   pixels.show();
 }
 
@@ -96,7 +117,7 @@ void set_pixels() {
 // Sets the signal processing preferences a give sensor.
 void configure_single_sensor(VL53L0X sensor) {
     sensor.init();
-    sensor.setTimeout(500);
+    sensor.setTimeout(1000);
 
     #if defined LONG_RANGE
       // lower the return signal rate limit (default is 0.25 MCPS)
@@ -113,35 +134,127 @@ void configure_single_sensor(VL53L0X sensor) {
       // increase timing budget to 200 ms
       sensor.setMeasurementTimingBudget(200000);
     #endif
+    sensor.startContinuous();
+}
+
+
+void initialize_shift_register() {
+    pinMode(shift_register_latch_pin, OUTPUT);
+    pinMode(shift_register_data_pin, OUTPUT);  
+    pinMode(shift_register_clock_pin, OUTPUT);
+}
+
+
+void write_to_shift_register(byte data) {
+    digitalWrite(shift_register_latch_pin, LOW);
+    shiftOut(shift_register_data_pin,
+             shift_register_clock_pin,
+             MSBFIRST,
+             data);
+    digitalWrite(shift_register_latch_pin, HIGH);
+}
+
+void turn_off_one_sensor(int xshut_pin) {      
+    if (xshut_pin> 0) {
+       pinMode(xshut_pins[xshut_pin], OUTPUT);
+       digitalWrite(xshut_pins[xshut_pin], LOW);
+    } else if (xshut_pin <= 0) {
+       // Set the corresponding bit in the shift register byte
+       // to low, then update the register.
+       bitWrite(shift_register_data, -xshut_pin, LOW);
+       write_to_shift_register(shift_register_data);
+    }
+}
+
+
+void turn_off_all_sensors() {
+    // Set all xshut pins to low, we'll bring them up one
+    // at a time.
+    for (int j = 0; j < MAXSENSORS; j++) {
+      turn_off_one_sensor(j);
+    }
+    // Just in case we make sure the shift register is fully off.
+    shift_register_data = 0;
+    write_to_shift_register(shift_register_data);
+}
+
+void turn_on_one_sensor(int xshut_pin) {      
+    if (xshut_pin> 0) {
+       // By changing the PIN mode we've set the pin
+       // to 'not LOW' (which is different than HIGH
+       pinMode(xshut_pin, INPUT);        
+    } else if (xshut_pin <= 0) {
+       // Set the corresponding bit in the shift register byte
+       // to high, then update the register.
+       bitWrite(shift_register_data, -xshut_pin, HIGH);
+       write_to_shift_register(shift_register_data);
+    }
+}
+
+bool is_sensor_available() {
+    // The i2c_scanner uses the return value of
+    // the Write.endTransmisstion to see if
+    // a device did acknowledge to the address.
+    Wire.beginTransmission(address_at_power_on);
+    byte error = Wire.endTransmission();
+    return error == 0;
+    Serial.print(" "); Serial.print(error); Serial.print(" ");
+}
+
+bool wait_for_sensor() {
+  unsigned long start_time = millis();
+  while(millis() <= (start_time + sensor_init_timeout)) {
+    if (is_sensor_available()) {
+      return true;
+    }
+    delay(50);
+  }
+  return false;
+}
+
+bool initialize_one_sensor(int j) {
+    Serial.print("Initializing sensor ");
+    Serial.print(j);
+    Serial.print(" on pin ");
+    Serial.print(xshut_pins[j]);
+    Serial.print(" with address ");
+    Serial.print(addresses[j]);
+    Serial.print(". xshut on");
+    turn_on_one_sensor(xshut_pins[j]);
+    if (wait_for_sensor()) {
+      Serial.print(". found");
+      sensors[j].setTimeout(1000);
+      if (!sensors[j].init()) {
+        sensor_available[j] = false;
+        return false;
+      }
+      Serial.print(". initialized");
+      sensors[j].setAddress(addresses[j]);
+      Serial.print(". readdressed");
+      configure_single_sensor(sensors[j]);
+      Serial.println(". configured ---");
+    } else {
+      Serial.println(". INIT TIMEDOUT.");
+      return false;
+    }
+    return true;
 }
 
 // Loops through each sensor and assigns a new address.  This
 // is required as all the sensors communicate over the i2c
 // interface but fire up with the same address.
 void initialize_sensors() {
-    // Set all xshut pins to low, we'll bring them up one
-    // at a time.
-    for (int j = 0; j < NUMSENSORS; j++) {
-        pinMode(xshut_pins[j], OUTPUT);
-        digitalWrite(xshut_pins[j], LOW);
-    }
+    turn_off_all_sensors();
     delay(100);
-  
     for (int j = 0; j < NUMSENSORS; j++) {
-        // By changing the PIN mode we've set the pin
-        // to 'not LOW' (which is different than HIGH
-        pinMode(xshut_pins[j], INPUT);
-        delay(5);
-    
-        Serial.print("Initializing sensor ");
-        Serial.print(j);
-        Serial.print(" with address ");
-        Serial.println(addresses[j]);
-        delay(5);
-        sensors[j].init(true);
-        sensors[j].setAddress(addresses[j]);
-    
-        configure_single_sensor(sensors[j]);
+        sensor_available[j] = initialize_one_sensor(j);
+        if (!sensor_available[j]) {
+          Serial.print("Turning off sensor ");
+          Serial.print(j);
+          Serial.println(" so it doesn't interfere with others");
+          turn_off_one_sensor(j);
+        }
+        delay(100);
     }
 }
 
@@ -149,33 +262,73 @@ void initialize_sensors() {
 // ratio which is later used to scale the intensity.
 void read_sensors() {
     int dist;
+    Serial.print("* ");
     for (int j = 0; j < NUMSENSORS; j++) {
-        dist = sensors[j].readRangeSingleMillimeters();
-        if (sensors[j].timeoutOccurred()) {
-            Serial.print(" TIMEOUT");
+        if (!sensor_available[j]) {
+          ratios[j] = 1.;
+          Serial.print("NAN, ");
         } else {
-          ratios[j] = dist / 1000.;
-          Serial.print(j); Serial.print(" : "); Serial.print(ratios[j]); Serial.print("  ");
-        }
+          dist = sensors[j].readRangeContinuousMillimeters();
+          dist = min(dist, MAX_DIST);
+          filters[j].input(dist);
+          dist = filters[j].output();
+          if (sensors[j].timeoutOccurred()) {
+              Serial.print("NaN,");
+          } else {
+            if (dist < MIN_DIST) {
+              dist = MAX_DIST;
+            }
+            ratios[j] = SMOOTHING * ratios[j] + (1. - SMOOTHING) * max(0., (dist - ZERO_DIST) / (MAX_DIST - ZERO_DIST));
+            Serial.print(ratios[j]); Serial.print(",    ");
+          }
+       }
     }
+    Serial.print("    "); Serial.print(millis());
     Serial.println("");
 }
 
 
+void initialize_filters() {
+  for (int j = 0; j < NUMSENSORS; j++) {  
+    filters[j] = FilterOnePole(LOWPASS, 5.0);
+  }
+}
+
+void set_ratio(double x) {
+  for (int j = 0; j < NUMSENSORS; j++) {
+    ratios[j] = x;
+  }
+}
+
+void flash_pixels() {
+  set_ratio(0.);
+  set_pixels();  
+  set_ratio(1.);
+  set_pixels();
+  set_ratio(0.);
+  set_pixels();  
+}
+
 void setup()
 {
+  delay(100);
   Serial.begin(9600);
   Wire.begin();
-
+  while(!Serial) {
+    delay(10);
+  }
+  Serial.println("setup");
+  initialize_shift_register();
   // Assign each sensor a different address and configure them.
   initialize_sensors();
   // This initializes the NeoPixel library.
   pixels.begin(); 
   // Initialize all pixels to 'off'
   pixels.show();
+  flash_pixels();
   // Precompute the intensity curve.
-  initialize_curve();  
-  delay(100);
+  initialize_curve();
+  Serial.println("Finished setup");
 }
 
 void loop()
@@ -184,5 +337,5 @@ void loop()
   read_sensors();
   // Refresh the light strip.
   set_pixels();
-  delay(10);
+  delay(5);
 }

@@ -11,13 +11,13 @@
 #include <VL53L0X.h>
 
 
-#define NUMSENSORS          2
+#define NUMSENSORS          3
 
 // The distance sensor
 VL53L0X sensors[NUMSENSORS];
 float ratios[]= {0., 0.};
 int centers[] = {100, 200};
-int xshut_pins[] = {6, 8};
+int xshut_pins[] = {5, 6};
 int addresses[] = {21, 22};
 int relative_location;
 float ratio;

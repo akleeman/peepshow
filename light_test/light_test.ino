@@ -11,7 +11,7 @@
 // https://learn.adafruit.com/adafruit-neopixel-uberguide/best-practices
 
 // Which pin on the Arduino is connected to the NeoPixels?
-#define PIN            6
+#define PIN            7
 
 // How many NeoPixels are attached to the Arduino?
 #define NUMPIXELS      300
